@@ -1,5 +1,5 @@
 /**
- *Submitted for verification at Etherscan.io on 2022-11-15
+ *Submitted for verification at Etherscan.io on 2022-11-17
 */
 
 // SPDX-License-Identifier: MIT
@@ -16,10 +16,9 @@
  * TW:  https://twitter.com/lockertoken
  *
  * LOCKER migration from: 0x1cc29ee9dd8d9ed4148f6600ba5ec84d7ee85d12
- * Legacy LOCKER Holders to receive 100% Tokens at TGE with an imposed 0.5 ETH daily sell limit.
  *
  * CONTRACT DEV: @seanking52
- *
+ * 
  */
 pragma solidity 0.8.17;
 
@@ -404,7 +403,7 @@ interface IDexFactory {
         returns (address pair);
 }
 
-contract LockerV2 is ERC20, Ownable {
+contract LKT is ERC20, Ownable {
     uint256 public maxBuyAmount;
     uint256 public maxSellAmount;
     uint256 public maxWallet;
@@ -417,17 +416,19 @@ contract LockerV2 is ERC20, Ownable {
 
     address public operationsAddress;
 
-    uint256 public tradingActiveBlock = 0;
+    uint256 public tradingActiveBlock = 0; // 0 means trading is not active
     uint256 public blockForPenaltyEnd;
-    address[] public botBuyers;
+    mapping(address => bool) public boughtEarly;
+    address[] public earlyBuyers;
     uint256 public botsCaught;
-    mapping(address => bool) public flaggedAsBot;
 
     bool public limitsInEffect = true;
     bool public tradingActive = false;
     bool public swapEnabled = false;
+    bool public earlyBuyerAdditionEnabled = true; // Can only be disabled!
 
-    mapping(address => uint256) private _holderLastTransferTimestamp;
+    // Anti-bot and anti-whale mappings and variables
+    mapping(address => uint256) private _holderLastTransferTimestamp; // to hold last Transfers temporarily during launch
     bool public transferDelayEnabled = true;
 
     uint256 public buyTotalFees;
@@ -443,14 +444,6 @@ contract LockerV2 is ERC20, Ownable {
 
     uint256 public tokensForOperations;
     uint256 public tokensForLiquidity;
-
-    bool public oldHolderSellLimitsEnabled = true;
-    uint256 public oldHolderCooldown = 1 minutes;
-    uint256 public oldHolderTimeBetweenBuys = 24 hours;
-
-    mapping(address => bool) public oldHolderWallets;
-    mapping(address => uint256) public nextOldHolderSellDate;
-    uint256 public maxOldHolderSell = .5 ether;
 
     /******************/
 
@@ -490,9 +483,9 @@ contract LockerV2 is ERC20, Ownable {
 
     event TransferForeignToken(address token, uint256 amount);
 
-    event UpdatedOldHolderMaxSell(uint256 amount);
+    event DisabledAddingEarlyBuyersForever();
 
-    constructor() payable ERC20("LOCKER", "LOCKER") {
+    constructor() payable ERC20("Locker Token", "LKT") {
         address newOwner = msg.sender; // can leave alone if owner is deployer.
 
         address _dexRouter;
@@ -521,14 +514,14 @@ contract LockerV2 is ERC20, Ownable {
         maxBuyAmount = (totalSupply * 25) / 10000; // 0.25%
         maxSellAmount = (totalSupply * 25) / 10000; // 0.25%
         maxWallet = (totalSupply * 15) / 1000; // 1.5%
-        swapTokensAtAmount = (totalSupply * 5) / 10000; // 0.05 %
+        swapTokensAtAmount = (totalSupply * 2) / 10000; // 0.02 %
 
-        buyOperationsFee = 6;
-        buyLiquidityFee = 3;
+        buyOperationsFee = 7;
+        buyLiquidityFee = 2;
         buyTotalFees = buyOperationsFee + buyLiquidityFee;
 
-        originalSellOperationsFee = 6;
-        originalSellLiquidityFee = 3;
+        originalSellOperationsFee = 7;
+        originalSellLiquidityFee = 2;
 
         sellOperationsFee = 12; // increased sell tax at launch
         sellLiquidityFee = 3;
@@ -550,11 +543,10 @@ contract LockerV2 is ERC20, Ownable {
 
         _createInitialSupply(
             address(0x258cb94167f233D2E6cf1C868873164321064664),
-            (totalSupply * 50) / 100
+            (totalSupply * 83) / 100
         ); // Tokens for exchanges, additional liq, etc.
-        _createInitialSupply(address(0xdead), (totalSupply * 25) / 100); // Burn
-        _createInitialSupply(address(this), (totalSupply * 5) / 100); // Tokens for liquidity
-        _createInitialSupply(newOwner, (totalSupply * 20) / 100); // Airdrop old holders
+        _createInitialSupply(address(this), (totalSupply * 2) / 100); // Tokens for liquidity
+        _createInitialSupply(newOwner, (totalSupply * 15) / 100); // Airdrop old holders
 
         transferOwnership(newOwner);
     }
@@ -574,50 +566,22 @@ contract LockerV2 is ERC20, Ownable {
         emit EnabledTrading();
     }
 
-    function getBotBuyers() external view returns (address[] memory) {
-        return botBuyers;
+    function getEarlyBuyers() external view returns (address[] memory) {
+        return earlyBuyers;
     }
 
-    function unflagBot(address wallet) external onlyOwner {
-        require(flaggedAsBot[wallet], "Wallet is already not flagged.");
-        flaggedAsBot[wallet] = false;
-    }
-
-    function flagBot(address wallet) external onlyOwner {
-        require(!flaggedAsBot[wallet], "Wallet is already flagged.");
-        flaggedAsBot[wallet] = true;
-    }
-
-    function flagV1Holder(address wallet) external onlyOwner {
-        require(!oldHolderWallets[wallet], "Wallet is already flagged.");
-        oldHolderWallets[wallet] = true;
-    }
-
-    function unflagV1Holder(address wallet) external onlyOwner {
-        require(oldHolderWallets[wallet], "Wallet is already not flagged.");
-        oldHolderWallets[wallet] = false;
-    }
-
-    function flagMultipleBots(address[] memory wallets) external onlyOwner {
+    function addBoughtEarly(address wallet) external onlyOwner {
         require(
-            wallets.length < 600,
-            "Can only mark 600 wallets per txn due to gas limits"
+            earlyBuyerAdditionEnabled,
+            "Early buyer addition has been disabled forever!!"
         );
-        for (uint256 i = 0; i < wallets.length; i++) {
-            address wallet = wallets[i];
-            flaggedAsBot[wallet] = true;
-        }
+        require(!boughtEarly[wallet], "Wallet is already flagged.");
+        boughtEarly[wallet] = true;
     }
 
-    function unflagMultipleBots(address[] memory wallets) external onlyOwner {
-        require(
-            wallets.length < 600,
-            "Can only mark 600 wallets per txn due to gas limits"
-        );
-        for (uint256 i = 0; i < wallets.length; i++) {
-            address wallet = wallets[i];
-            flaggedAsBot[wallet] = false;
-        }
+    function removeBoughtEarly(address wallet) external onlyOwner {
+        require(boughtEarly[wallet], "Wallet is already not flagged.");
+        boughtEarly[wallet] = false;
     }
 
     function emergencyUpdateRouter(address router) external onlyOwner {
@@ -646,7 +610,7 @@ contract LockerV2 is ERC20, Ownable {
     function updateMaxSellAmount(uint256 newNum) external onlyOwner {
         require(
             newNum >= ((totalSupply() * 25) / 10000) / 1e18,
-            "Cannot set max sell amount lower than 0.25%"
+            "Cannot set max buy amount lower than 0.25%"
         );
         require(
             newNum <= ((totalSupply() * 2) / 100) / 1e18,
@@ -662,8 +626,8 @@ contract LockerV2 is ERC20, Ownable {
             "Cannot set max wallet amount lower than 0.5%"
         );
         require(
-            newNum <= ((totalSupply() * 4) / 100) / 1e18,
-            "Cannot set max wallet amount higher than 4%"
+            newNum <= ((totalSupply() * 2) / 100) / 1e18,
+            "Cannot set max wallet amount higher than 2%"
         );
         maxWallet = newNum * (10**18);
         emit UpdatedMaxWalletAmount(maxWallet);
@@ -773,32 +737,9 @@ contract LockerV2 is ERC20, Ownable {
 
         if (!earlyBuyPenaltyInEffect() && tradingActive) {
             require(
-                !flaggedAsBot[from] || to == owner() || to == address(0xdead),
+                !boughtEarly[from] || to == owner() || to == address(0xdead),
                 "Bots cannot transfer tokens in or out except to owner or dead address."
             );
-        }
-
-        if (oldHolderSellLimitsEnabled) {
-            if (oldHolderWallets[from]) {
-                if (automatedMarketMakerPairs[to]) {
-                    //enforce max sell restrictions.
-                    require(
-                        nextOldHolderSellDate[from] <= block.timestamp,
-                        "Cannot sell yet"
-                    );
-                    require(
-                        amount <= getOldHolderMaxSell(),
-                        "Attempting to sell over max sell amount.  Check max."
-                    );
-                    nextOldHolderSellDate[from] =
-                        block.timestamp +
-                        oldHolderTimeBetweenBuys;
-                } else if (!_isExcludedFromFees[to]) {
-                    revert(
-                        "V1 Holders cannot transfer and must sell only or transfer to a whitelisted address."
-                    );
-                }
-            }
         }
 
         if (limitsInEffect) {
@@ -891,10 +832,10 @@ contract LockerV2 is ERC20, Ownable {
                     maxBuyAmount -= 1;
                 }
 
-                if (!flaggedAsBot[to]) {
-                    flaggedAsBot[to] = true;
+                if (!boughtEarly[to]) {
+                    boughtEarly[to] = true;
                     botsCaught += 1;
-                    botBuyers.push(to);
+                    earlyBuyers.push(to);
                     emit CaughtEarlyBuyer(to);
                 }
 
@@ -925,19 +866,6 @@ contract LockerV2 is ERC20, Ownable {
         }
 
         super._transfer(from, to, amount);
-    }
-
-    function getOldHolderMaxSell() public view returns (uint256) {
-        address[] memory path = new address[](2);
-        path[0] = dexRouter.WETH();
-        path[1] = address(this);
-
-        uint256[] memory amounts = new uint256[](2);
-        amounts = dexRouter.getAmountsOut(maxOldHolderSell, path);
-        return
-            amounts[1] +
-            (amounts[1] * (sellLiquidityFee + sellOperationsFee)) /
-            100;
     }
 
     function earlyBuyPenaltyInEffect() public view returns (bool) {
@@ -1074,74 +1002,7 @@ contract LockerV2 is ERC20, Ownable {
         limitsInEffect = true;
     }
 
-    function setOldHolderMaxSell(uint256 amount) external onlyOwner {
-        require(
-            amount >= 10 && amount <= 2500,
-            "Must set between 0.10 and 25 ETH"
-        );
-        maxOldHolderSell = amount * 1e16;
-        emit UpdatedOldHolderMaxSell(amount);
-    }
-
-    function emergencyToggleOldHolderSellLimits(bool _enabled)
-        public
-        onlyOwner
-    {
-        oldHolderSellLimitsEnabled = _enabled;
-    }
-
-    function updateOldHolderCooldown(uint256 timeInMinutes) external onlyOwner {
-        require(timeInMinutes > 0 && timeInMinutes <= 1440);
-        oldHolderCooldown = timeInMinutes * 1 minutes;
-    }
-
-    function updateOldHolderTimeBetweenBuys(uint256 timeInMinutes)
-        external
-        onlyOwner
-    {
-        require(timeInMinutes > 0 && timeInMinutes <= 1440);
-        oldHolderTimeBetweenBuys = timeInMinutes * 1 minutes;
-    }
-
-    function launchToken(uint256 blocksForPenalty) external onlyOwner {
-        require(!tradingActive, "Trading is already active, cannot relaunch.");
-        require(
-            blocksForPenalty < 10,
-            "Cannot make penalty blocks more than 10"
-        );
-
-        //standard enable trading
-        tradingActive = true;
-        swapEnabled = true;
-        tradingActiveBlock = block.number;
-        blockForPenaltyEnd = tradingActiveBlock + blocksForPenalty;
-        emit EnabledTrading();
-
-        // add the liquidity
-
-        require(
-            address(this).balance > 0,
-            "Must have ETH on contract to launch"
-        );
-
-        require(
-            balanceOf(address(this)) > 0,
-            "Must have Tokens on contract to launch"
-        );
-
-        _approve(address(this), address(dexRouter), balanceOf(address(this)));
-
-        dexRouter.addLiquidityETH{value: address(this).balance}(
-            address(this),
-            balanceOf(address(this)),
-            0, // slippage is unavoidable
-            0, // slippage is unavoidable
-            msg.sender,
-            block.timestamp
-        );
-    }
-
-    function addLpWithoutLaunch(bool confirmAddLp) external onlyOwner {
+    function addLP(bool confirmAddLp) external onlyOwner {
         require(confirmAddLp, "Please confirm adding of the LP");
         require(!tradingActive, "Trading is already active, cannot relaunch.");
 
@@ -1167,9 +1028,42 @@ contract LockerV2 is ERC20, Ownable {
         );
     }
 
-    /**
-     * Airdrop WITHOUT applying sell restrictions
-     */
+    function launch(uint256 blocksForPenalty) external onlyOwner {
+        require(!tradingActive, "Trading is already active, cannot relaunch.");
+        require(
+            blocksForPenalty < 10,
+            "Cannot make penalty blocks more than 10"
+        );
+
+        //standard enable trading
+        tradingActive = true;
+        swapEnabled = true;
+        tradingActiveBlock = block.number;
+        blockForPenaltyEnd = tradingActiveBlock + blocksForPenalty;
+        emit EnabledTrading();
+
+        // add the liquidity
+        require(
+            address(this).balance > 0,
+            "Must have ETH on contract to launch"
+        );
+        require(
+            balanceOf(address(this)) > 0,
+            "Must have Tokens on contract to launch"
+        );
+
+        _approve(address(this), address(dexRouter), balanceOf(address(this)));
+
+        dexRouter.addLiquidityETH{value: address(this).balance}(
+            address(this),
+            balanceOf(address(this)),
+            0, // slippage is unavoidable
+            0, // slippage is unavoidable
+            msg.sender,
+            block.timestamp
+        );
+    }
+
     function airdropToWallets(
         address[] memory wallets,
         uint256[] memory amountsInTokens
@@ -1190,27 +1084,15 @@ contract LockerV2 is ERC20, Ownable {
     }
 
     /**
-     * Sell restrictions will be applied to V1 Holders
+     * This function will disable the possibility to add early buyers FOREVER
      */
-    function airdropV1Holders(
-        address[] memory wallets,
-        uint256[] memory amountsInTokens
-    ) external onlyOwner {
-        require(
-            wallets.length == amountsInTokens.length,
-            "arrays must be the same length"
-        );
-        require(
-            wallets.length < 200,
-            "Can only airdrop 200 wallets per txn due to gas limits"
-        ); // allows for airdrop + launch at the same exact time, reducing delays and reducing sniper input.
-        for (uint256 i = 0; i < wallets.length; i++) {
-            address wallet = wallets[i];
-            uint256 amount = amountsInTokens[i];
-
-            oldHolderWallets[wallet] = true;
-            nextOldHolderSellDate[wallet] = block.timestamp + oldHolderCooldown;
-            super._transfer(msg.sender, wallet, amount);
-        }
+    function disableAddingEarlyBuyersForever(bool confirmDisableFeatureForever)
+        external
+        onlyOwner
+    {
+        require(confirmDisableFeatureForever, "Please confirm");
+        require(earlyBuyerAdditionEnabled, "Already disabled forever!");
+        earlyBuyerAdditionEnabled = false;
+        emit DisabledAddingEarlyBuyersForever();
     }
 }
